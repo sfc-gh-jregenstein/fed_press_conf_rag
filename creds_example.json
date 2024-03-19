@@ -1,0 +1,9 @@
+{
+    "account": "your account",
+    "user": "your usename",
+    "password": "your pw",
+    "role": "ACCOUNTADMIN",
+    "database" : "your database",
+     "warehouse" : "your wh",
+    "schema": "your schema"
+  }
