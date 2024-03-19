@@ -1,0 +1,144 @@
+---
+title: "Untitled"
+format: html
+---
+
+### Set up snowflake
+
+Before running this notebook, make sure you have set up your Snowflake database, schema and stages. 
+
+- Go to your Snowflake UI and create a database called "RAG_DEMO". 
+- In that database, create a schema called "RAG_DEMO_SCHEMA". 
+- In that schema, create one internal stage called "UDF" and one internal stage called "ACME_EARNINGS".
+- Open that stage called "FED_PRESS_CONF", click on +files, and load the ACME earnings call PDF into that stage. 
+
+### Create Conda environment
+
+Next we need to create our conda environment.
+
+In the terminal, run: 
+
+1) conda create --name rag-demo --override-channels -c https://repo.anaconda.com/pkgs/snowflake python=3.11
+2) conda activate rag-demo
+3) conda install -c https://repo.anaconda.com/pkgs/snowflake snowflake-connector-python snowflake-snowpark-python snowflake-ml-python langchain PyPDF2 io pandas
+
+### Import Libraries
+
+
+```{python}
+import pandas as pd
+from PyPDF2 import PdfFileReader
+from snowflake.snowpark.files import SnowflakeFile
+from io import BytesIO
+from snowflake.snowpark.types import StringType, StructField, StructType
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+
+from snowflake.snowpark.session import Session
+import json
+```
+
+### Establish Connection to Snowflake
+
+Create a text file to hold your Snowflake credentials. I call mine "creds.json". 
+
+It has the following information: 
+
+{
+    "account": "your account",
+    "user": "your username",
+    "password": "your password",
+    "role": "ACCOUNTADMIN",
+    "database" : "RAG_DEMO",
+     "warehouse" : "your warehouse",
+    "schema": "RAG_DEMO_SCHEMA"
+  }
+
+Next run this cell to establish a connection to your Snowflake session.
+```{python}
+# Read credentials
+with open('creds.json') as f:
+    connection_parameters = json.load(f)
+# Connect to a snowflake session
+session = Session.builder.configs(connection_parameters).create()
+```
+
+### Create PDF Extract Function using PyPDF2
+
+Create a function to extract text from a PDF and store it as characters in a table.
+
+```{python}
+def readpdf(file_path):
+    whole_text = ""
+    with SnowflakeFile.open(file_path, 'rb') as file:
+        f = BytesIO(file.readall())
+        pdf_reader = PdfFileReader(f)
+        whole_text = ""
+        for page in pdf_reader.pages:
+            whole_text += page.extract_text()
+    return whole_text
+```
+
+### Register Function as User Defined Function
+
+```{python}
+ 
+
+session.udf.register(
+    func = readpdf
+  , return_type = StringType()
+  , input_types = [StringType()]
+  , is_permanent = True
+  , name = 'SNOWPARK_PDF'
+  , replace = True
+  , packages=['snowflake-snowpark-python','pypdf2']
+  , stage_location = 'RAG_DEMO.RAG_DEMO_SCHEMA.UDF'
+)
+```
+
+### Create UDTF For Chunking via Langchain
+```{python}
+# A class for chunking text and returning a table via UDTF
+from snowflake.snowpark.types import StringType, StructField, StructType
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+
+class text_chunker:
+
+    def process(self,text):        
+        text_raw=[]
+        text_raw.append(text) 
+        
+        text_splitter = RecursiveCharacterTextSplitter(
+            separators = ["\n"], # Define an appropriate separator. New line is good typically!
+            chunk_size = 1000, # Adjust this as you see fit
+            chunk_overlap  = 50, # This let's text have some form of overlap. Useful for keeping chunks contextual
+            length_function = len,
+            add_start_index = True # Optional but useful if you'd like to feed the chunk before/after
+        )
+    
+        chunks = text_splitter.create_documents(text_raw)
+        df = pd.DataFrame(chunks, columns=['chunks','meta'])
+        
+        yield from df.itertuples(index=False, name=None)
+```
+
+### Register the UDTF - set the stage location
+
+```{python}
+
+schema = StructType([
+     StructField("chunk", StringType()),
+    StructField("meta", StringType()),
+ ])
+
+session.udtf.register( 
+    handler = text_chunker,
+    output_schema= schema, 
+    input_types = [StringType()] , 
+    is_permanent = True , 
+    name = 'CHUNK_TEXT' , 
+    replace = True , 
+    packages=['pandas','langchain'], stage_location = 'RAG_DEMO.RAG_DEMO_SCHEMA.UDF' )
+```
+
+We can now close VSCode and this Python code and head over to Snowflake to run sql in a worksheet.
